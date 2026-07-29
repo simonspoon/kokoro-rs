@@ -74,6 +74,9 @@ impl SpeakerSink {
 
         let config = output_config(&device, sample_rate)?;
         let channels = config.channels as usize;
+        // The device does not always run at the model's rate; if it does not,
+        // the callback has to resample rather than hand samples over one-for-one.
+        let step = sample_rate as f64 / config.sample_rate as f64;
 
         let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<f32>>(QUEUE_DEPTH);
         let state = Arc::new(PlaybackState {
@@ -86,7 +89,8 @@ impl SpeakerSink {
         let mut playback = Playback {
             receiver,
             current: Vec::new(),
-            position: 0,
+            position: 0.0,
+            step,
         };
         let callback_state = Arc::clone(&state);
         let error_state = Arc::clone(&state);
@@ -185,7 +189,12 @@ impl Sink for SpeakerSink {
 struct Playback {
     receiver: Receiver<Vec<f32>>,
     current: Vec<f32>,
-    position: usize,
+    /// Read position within `current`, fractional because the device rate and
+    /// the model rate need not divide evenly.
+    position: f64,
+    /// Source samples consumed per output frame: 1.0 when the device runs at
+    /// the model's rate, 0.5 when it runs at twice it, and so on.
+    step: f64,
 }
 
 impl Playback {
@@ -197,28 +206,44 @@ impl Playback {
         }
 
         for frame in output.chunks_mut(channels) {
-            if self.position >= self.current.len() {
-                match self.receiver.try_recv() {
-                    Ok(chunk) => {
-                        self.current = chunk;
-                        self.position = 0;
-                    }
-                    Err(_) => {
-                        // Nothing queued: silence. If the producer has finished
-                        // and the channel is empty, playback is complete.
-                        frame.fill(0.0);
-                        if state.finished.load(Ordering::SeqCst) {
-                            state.drained.store(true, Ordering::SeqCst);
-                        }
-                        continue;
+            match self.next_sample() {
+                // Mono is duplicated across whatever channel count the device wants.
+                Some(sample) => frame.fill(sample),
+                None => {
+                    // Nothing queued: silence. If the producer has finished
+                    // and the channel is empty, playback is complete.
+                    frame.fill(0.0);
+                    if state.finished.load(Ordering::SeqCst) {
+                        state.drained.store(true, Ordering::SeqCst);
                     }
                 }
             }
-            let sample = self.current[self.position];
-            self.position += 1;
-            // Mono is duplicated across whatever channel count the device wants.
-            frame.fill(sample);
         }
+    }
+
+    /// The next output sample, linearly interpolated from the queued audio.
+    /// Returns `None` when nothing is queued.
+    fn next_sample(&mut self) -> Option<f32> {
+        while self.position >= self.current.len() as f64 {
+            match self.receiver.try_recv() {
+                Ok(chunk) => {
+                    // Carry the fraction over so the phase does not reset — and
+                    // so a stray empty chunk cannot stall the position.
+                    self.position -= self.current.len() as f64;
+                    self.current = chunk;
+                }
+                Err(_) => return None,
+            }
+        }
+
+        let index = self.position as usize;
+        let frac = (self.position - index as f64) as f32;
+        let a = self.current[index];
+        // At the very end of a chunk there is no successor to interpolate
+        // towards; holding the sample costs one frame at the join.
+        let b = self.current.get(index + 1).copied().unwrap_or(a);
+        self.position += self.step;
+        Some(a + (b - a) * frac)
     }
 }
 
@@ -234,7 +259,8 @@ fn output_config(device: &cpal::Device, sample_rate: u32) -> Result<cpal::Stream
     let config = match supported {
         Some(config) => config,
         // The model's 24 kHz is not universally supported; fall back to the
-        // device default rather than failing. CoreAudio resamples for us.
+        // device default rather than failing. Nothing below us resamples, so
+        // the callback has to — see `Playback::step`.
         None => device
             .default_output_config()
             .context("no usable output configuration")?,
