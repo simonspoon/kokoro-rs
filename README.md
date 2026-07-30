@@ -14,8 +14,20 @@ model — no network access is needed.
 ## Install
 
 ```sh
-cargo build --release
+scripts/install.sh
 ```
+
+That builds in release mode and copies the binary to `~/.local/bin`. Override
+the destination with `PREFIX` (installs into `$PREFIX/bin`) or `BINDIR` (an
+exact directory):
+
+```sh
+PREFIX=/usr/local scripts/install.sh
+BINDIR=/opt/bin scripts/install.sh
+```
+
+To build without installing, use `cargo build --release`; the binary lands in
+`target/release/kokoro-rs`.
 
 The first invocation downloads the model (~326 MB), the voices (~28 MB) and the
 ONNX Runtime shared library (~40 MB) into `~/.cache/kokoro-rs`. espeak-ng is
