@@ -107,7 +107,7 @@ impl Synthesiser {
 ///
 /// Chunks are already sized so this rarely fires, but a chunk dense in short
 /// words can still exceed 510 phonemes. Splits land on punctuation where
-/// possible, since a break mid-word is audible.
+/// possible, then on word boundaries, since a break mid-word is audible.
 fn split_phonemes(phonemes: &str) -> Vec<String> {
     const BREAKS: [char; 5] = ['.', ',', '!', '?', ';'];
 
@@ -125,14 +125,21 @@ fn split_phonemes(phonemes: &str) -> Vec<String> {
 
     let mut batches = Vec::new();
     let mut current = String::new();
-    for part in parts {
+    for part in parts
+        .into_iter()
+        .flat_map(|part| split_run(part, MAX_PHONEME_LENGTH))
+    {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
         // Lengths are in characters, as in the Python original.
         if current.chars().count() + part.chars().count() + 1 >= MAX_PHONEME_LENGTH {
-            batches.push(current.trim().to_string());
+            // A part that fills the context on its own arrives with nothing
+            // ahead of it, and an empty batch would synthesise nothing.
+            if !current.is_empty() {
+                batches.push(current.trim().to_string());
+            }
             current = part.to_string();
         } else if part.chars().count() == 1 && BREAKS.contains(&part.chars().next().unwrap()) {
             current.push_str(part);
@@ -147,6 +154,43 @@ fn split_phonemes(phonemes: &str) -> Vec<String> {
         batches.push(current.trim().to_string());
     }
     batches
+}
+
+/// Break a run of phonemes with no punctuation in it into pieces of at most
+/// `limit` characters, at word boundaries where possible.
+///
+/// Text expands into phonemes unevenly — "1234567" becomes forty of them — so a
+/// chunk sized in characters can still hold a punctuation-free run longer than
+/// the context. Left whole, such a run is truncated by [`phonemes::tokenize`]
+/// and the rest of the sentence is never spoken.
+fn split_run(run: &str, limit: usize) -> Vec<&str> {
+    if run.chars().count() <= limit {
+        return vec![run];
+    }
+
+    let mut pieces = Vec::new();
+    // Byte offset where the piece being built starts, how many characters it
+    // holds, and where its last word break was.
+    let mut start = 0;
+    let mut count = 0;
+    let mut space: Option<usize> = None;
+    for (i, c) in run.char_indices() {
+        if count == limit {
+            // A cut mid-word is audible, so fall back to one only when the
+            // piece is a single word longer than the whole context.
+            let cut = space.unwrap_or(i);
+            pieces.push(&run[start..cut]);
+            start = if cut == i { i } else { cut + 1 };
+            count = run[start..i].chars().count();
+            space = None;
+        }
+        if c == ' ' {
+            space = Some(i);
+        }
+        count += 1;
+    }
+    pieces.push(&run[start..]);
+    pieces
 }
 
 #[cfg(test)]
@@ -174,6 +218,41 @@ mod tests {
                 .all(|b| b.chars().count() < MAX_PHONEME_LENGTH)
         );
         assert!(batches[0].ends_with('.'));
+    }
+
+    #[test]
+    fn over_long_runs_without_punctuation_are_split_at_words() {
+        // Numbers and dates expand several-fold into phonemes, so a chunk sized
+        // in characters can hold more than the model can read in one pass.
+        let word = "wˈʌn ";
+        let run = word.repeat(200);
+        let batches = split_phonemes(run.trim());
+        assert!(batches.len() > 1);
+        assert!(
+            batches
+                .iter()
+                .all(|b| b.chars().count() <= MAX_PHONEME_LENGTH),
+            "{:?}",
+            batches
+                .iter()
+                .map(|b| b.chars().count())
+                .collect::<Vec<_>>()
+        );
+        // Nothing is dropped and no word is cut in half.
+        assert_eq!(batches.join(" "), run.trim());
+    }
+
+    #[test]
+    fn a_single_over_long_word_is_cut() {
+        let run = "a".repeat(MAX_PHONEME_LENGTH * 2 + 5);
+        let batches = split_phonemes(&run);
+        assert_eq!(batches.len(), 3);
+        assert!(
+            batches
+                .iter()
+                .all(|b| b.chars().count() <= MAX_PHONEME_LENGTH)
+        );
+        assert_eq!(batches.concat(), run);
     }
 
     #[test]
