@@ -2,13 +2,25 @@
 name = "kokoro-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Command-line text-to-speech with Kokoro v1.0, streaming to your speakers as it synthesises"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/simonspoon/kokoro-rs"
+readme = "README.md"
+keywords = ["tts", "text-to-speech", "kokoro", "cli", "onnx"]
+categories = ["command-line-utilities", "multimedia::audio"]
 
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
 cpal = "0.18.1"
 ctrlc = "3.5.2"
-espeak-rs = "0.2.0"
+# default-features = false turns off `compile-espeak-intonations`, which makes
+# espeak-ng's cmake compile its data files. That step resolves its input as
+# `<build dir>/../phsource`, which only exists in espeak-ng's own in-tree
+# layout, so under the cmake crate it fails and takes the whole build with it.
+# Nothing is lost: the data we actually use is the vendored
+# assets/espeak-ng-data.tar.gz, which already contains `intonations`.
+espeak-rs = { version = "0.2.0", default-features = false }
 flate2 = "1.1.9"
 hound = "3.5.1"
 ndarray = "0.17.2"
