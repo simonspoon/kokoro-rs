@@ -22,8 +22,36 @@ pub const MODEL_FILE: &str = "kokoro-v1.0.onnx";
 pub const VOICES_FILE: &str = "voices-v1.0.bin";
 
 /// The last ONNX Runtime release with an official x86_64 macOS build, and the
-/// version the Python project pinned for the same reason.
+/// version the Python project pinned for the same reason. Every other platform
+/// we ship is published under the same version, so one pin covers all four.
 const ORT_VERSION: &str = "1.23.2";
+
+/// The platform tag in Microsoft's ONNX Runtime release archives.
+///
+/// A binary only ever needs its own platform's build, so this is chosen at
+/// compile time; an unsupported target fails to build rather than fetching an
+/// archive that cannot be loaded.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const ORT_PLATFORM: &str = "osx-x86_64";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ORT_PLATFORM: &str = "osx-arm64";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const ORT_PLATFORM: &str = "linux-x64";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const ORT_PLATFORM: &str = "linux-aarch64";
+
+/// The shared library's name inside that archive.
+///
+/// The two platforms disagree about more than the extension: macOS puts the
+/// version before it (`libonnxruntime.1.23.2.dylib`), Linux after the soname
+/// (`libonnxruntime.so.1.23.2`).
+fn ort_lib_name() -> String {
+    if cfg!(target_os = "macos") {
+        format!("libonnxruntime.{ORT_VERSION}.dylib")
+    } else {
+        format!("libonnxruntime.so.{ORT_VERSION}")
+    }
+}
 
 /// espeak-ng's dictionaries, phoneme tables and voice definitions.
 ///
@@ -122,7 +150,7 @@ pub fn ensure_onnxruntime(download: bool) -> Result<PathBuf> {
         return Ok(path);
     }
 
-    let dylib = cache_dir().join(format!("libonnxruntime.{ORT_VERSION}.dylib"));
+    let dylib = cache_dir().join(ort_lib_name());
     if !dylib.is_file() {
         if !download {
             bail!(
@@ -140,7 +168,7 @@ pub fn ensure_onnxruntime(download: bool) -> Result<PathBuf> {
 
 /// Download the ONNX Runtime release tarball and extract just the dylib.
 fn fetch_onnxruntime(dest: &Path) -> Result<()> {
-    let name = format!("onnxruntime-osx-x86_64-{ORT_VERSION}");
+    let name = format!("onnxruntime-{ORT_PLATFORM}-{ORT_VERSION}");
     let url = format!(
         "https://github.com/microsoft/onnxruntime/releases/download/v{ORT_VERSION}/{name}.tgz"
     );
@@ -148,8 +176,9 @@ fn fetch_onnxruntime(dest: &Path) -> Result<()> {
 
     let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(tarball));
     let mut archive = tar::Archive::new(decoder);
-    // Matched as a suffix: the archive stores paths as `./<name>/lib/...`.
-    let wanted = format!("lib/libonnxruntime.{ORT_VERSION}.dylib");
+    // Matched as a suffix: the macOS archives store paths as `./<name>/lib/...`
+    // and the Linux ones as `<name>/lib/...`.
+    let wanted = format!("lib/{}", ort_lib_name());
 
     for entry in archive
         .entries()
