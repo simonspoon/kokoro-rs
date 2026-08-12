@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # Every target builds on a native runner. espeak-rs-sys's build script decides
+  # what to link with `cfg!(target_os = ...)`, which in a build script describes
+  # the host rather than the target, and it passes no --target to bindgen — so a
+  # cross-compiled binary would be linked wrong. Native runners sidestep it.
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: kokoro-rs-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            name: kokoro-rs-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            name: kokoro-rs-darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: kokoro-rs-darwin-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # cmake drives the espeak-ng build, bindgen needs libclang, and cpal needs
+      # the ALSA headers. macOS runners already ship cmake and clang.
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev pkg-config libasound2-dev
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: cp target/${{ matrix.target }}/release/kokoro-rs ${{ matrix.name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  update-tap:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh api repos/simonspoon/homebrew-tap/dispatches \
+            -f event_type=update-formula \
+            -f "client_payload[tool]=kokoro-rs" \
+            -f "client_payload[version]=$VERSION" \
+            -f "client_payload[repo]=simonspoon/kokoro-rs"
