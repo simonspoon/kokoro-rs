@@ -4,8 +4,8 @@ Command-line text-to-speech using [Kokoro v1.0](https://huggingface.co/hexgrad/K
 an 82M-parameter open-weight model. Takes text as an argument or on stdin and
 streams the audio to your speakers as it is generated, or writes it to a file.
 
-A Rust rewrite of [`kokoro3`](../kokoro3), the Python version. Output is
-bit-identical to it for the same text, voice and speed — see
+A Rust rewrite of `kokoro3`, an unpublished Python implementation of the same
+model. Output is bit-identical to it for the same text, voice and speed — see
 [Verification](#verification).
 
 Everything runs locally on the CPU. After the first run — which downloads the
@@ -14,6 +14,25 @@ model — no network access is needed.
 ## Install
 
 ```sh
+brew install simonspoon/tap/kokoro-rs
+```
+
+### Build from source
+
+espeak-ng is compiled from source as part of the build, so you need Rust
+(edition 2024), CMake, a C and C++ compiler, and libclang for the bindings.
+On Debian or Ubuntu:
+
+```sh
+sudo apt-get install cmake clang libclang-dev pkg-config libasound2-dev
+```
+
+`libasound2-dev` is for ALSA, which the audio output needs. On macOS the Xcode
+command line tools plus `brew install cmake` cover it.
+
+```sh
+git clone https://github.com/simonspoon/kokoro-rs.git
+cd kokoro-rs
 scripts/install.sh
 ```
 
@@ -85,7 +104,10 @@ with a script under `scripts/` that runs both and compares:
 | `diff_phonemes.py` | IPA strings and token IDs | 148/148 identical |
 | `diff_audio.py` | rendered WAV samples | 12/13 bit-identical, 1 within 1 LSB |
 
-They need the `kokoro3` virtualenv, which supplies the reference:
+The scripts expect `kokoro3` checked out beside this repo, with its virtualenv
+built, since that is what supplies the reference output. That implementation is
+not published, so these are recorded results rather than something you can
+re-run from a fresh clone:
 
 ```sh
 cargo build --release
@@ -101,10 +123,12 @@ boundary rounds the other way. That is about 90 dB below the signal.
 
 ## Notes
 
-- **Intel Macs.** `ort` ships no prebuilt ONNX Runtime for x86_64 macOS, so the
-  binary loads it dynamically and fetches Microsoft's own 1.23.2 release — the
-  last with an official Intel build, and the version `kokoro3` pinned for the
-  same reason. Set `ORT_DYLIB_PATH` to use a different one.
+- **ONNX Runtime.** `ort` ships no prebuilt binary for x86_64 macOS, so rather
+  than link one at build time kokoro-rs loads it dynamically and fetches
+  Microsoft's own release for the platform it is running on. The version is
+  pinned at 1.23.2 — the last with an official Intel Mac build, which is the
+  constraint that set it; the other three platforms publish that version too,
+  so one pin covers them all. Set `ORT_DYLIB_PATH` to use a different one.
 - **Deliberate differences from the Python version.** File output is WAV only,
   where `soundfile` also offered FLAC and others; a non-WAV extension is
   rejected with a clear message rather than silently mis-encoded. Float samples
@@ -117,3 +141,19 @@ boundary rounds the other way. That is about 90 dB below the signal.
   `espeak-rs-sys`.
 - Model location can be overridden with `KOKORO_MODEL`, `KOKORO_VOICES`, or
   `KOKORO_HOME`.
+
+## License
+
+GPL-3.0-or-later — see [LICENSE](LICENSE).
+
+The choice is not really a choice: kokoro-rs links espeak-ng (through
+`espeak-rs-sys`) into the binary, and espeak-ng is GPL-3.0-or-later, so
+anything built here is a derivative work under that licence. The vendored
+`assets/espeak-ng-data.tar.gz` is espeak-ng's own data, under the same terms.
+
+Two things are *not* covered by it and are fetched at runtime rather than
+bundled: the [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) model and
+its voices (Apache-2.0), and the ONNX Runtime shared library (MIT).
+
+[THIRD-PARTY.md](THIRD-PARTY.md) has the copyright notices and the written
+offer of corresponding source.
