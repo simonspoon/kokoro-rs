@@ -10,8 +10,11 @@ use clap::Parser;
 
 use crate::audio::{self, Sink};
 use crate::models;
+use crate::phonemes::{self, MAX_PHONEME_LENGTH};
 use crate::synth::{SAMPLE_RATE, Synthesiser};
-use crate::text::{self, CHUNK_CHARS, ChunkStream, FIRST_CHUNK_CHARS};
+use crate::text::{
+    self, Budget, CHUNK_PHONEMES, Chunk, ChunkStream, FIRST_CHUNK_CHARS, FIRST_CHUNK_PHONEMES,
+};
 
 const DEFAULT_VOICE: &str = "af_heart";
 const DEFAULT_LANG: &str = "en-us";
@@ -64,9 +67,13 @@ pub struct Args {
     #[arg(long)]
     list_devices: bool,
 
-    /// Max characters per synthesis chunk
+    /// Optional cap on the characters per synthesis chunk
     #[arg(long, value_name = "N")]
     chunk_chars: Option<usize>,
+
+    /// Max phonemes per synthesis chunk (the model reads 510)
+    #[arg(long, default_value_t = CHUNK_PHONEMES, value_name = "N")]
+    chunk_phonemes: usize,
 
     /// Silence inserted between sentences
     #[arg(long, default_value_t = 0.12, value_name = "SECONDS")]
@@ -132,6 +139,14 @@ fn run(args: Args) -> Result<i32> {
         eprintln!("kokoro-rs: --chunk-chars must be at least 20");
         return Ok(USAGE);
     }
+    if args.chunk_phonemes < 20 {
+        eprintln!("kokoro-rs: --chunk-phonemes must be at least 20");
+        return Ok(USAGE);
+    }
+    if args.chunk_phonemes > MAX_PHONEME_LENGTH {
+        eprintln!("kokoro-rs: --chunk-phonemes cannot exceed {MAX_PHONEME_LENGTH}");
+        return Ok(USAGE);
+    }
     if args.gap < 0.0 {
         eprintln!("kokoro-rs: --gap cannot be negative");
         return Ok(USAGE);
@@ -160,9 +175,20 @@ fn run(args: Args) -> Result<i32> {
         return Ok(USAGE);
     }
 
-    let chunk_chars = args.chunk_chars.unwrap_or(CHUNK_CHARS);
-    let first_chunk_chars = FIRST_CHUNK_CHARS.min(chunk_chars);
-    let mut stream = ChunkStream::new(first_chunk_chars, chunk_chars);
+    // Chunks are measured in phonemes, so the chunker does the phonemising and
+    // hands the result to the synthesiser rather than it being done twice.
+    let lang = args.lang.clone();
+    let first = Budget {
+        phonemes: FIRST_CHUNK_PHONEMES.min(args.chunk_phonemes),
+        chars: args.chunk_chars.map(|c| FIRST_CHUNK_CHARS.min(c)),
+    };
+    let rest = Budget {
+        phonemes: args.chunk_phonemes,
+        chars: args.chunk_chars,
+    };
+    let mut stream = ChunkStream::new(first, rest, move |text: &str| {
+        phonemes::phonemize(text, &lang)
+    });
 
     let from_stdin = args.text.is_empty();
     if from_stdin && std::io::stdin().is_terminal() {
@@ -180,7 +206,7 @@ fn run(args: Args) -> Result<i32> {
         for line in stdin.lock().lines() {
             let mut line = line?;
             line.push('\n');
-            for chunk in stream.push(&line) {
+            for chunk in stream.push(&line)? {
                 if !speaker.speak(&mut synth, &chunk)? {
                     break;
                 }
@@ -190,14 +216,14 @@ fn run(args: Args) -> Result<i32> {
             }
         }
     } else {
-        for chunk in stream.push(&args.text.join(" ")) {
+        for chunk in stream.push(&args.text.join(" "))? {
             if !speaker.speak(&mut synth, &chunk)? {
                 break;
             }
         }
     }
     if !speaker.interrupted {
-        for chunk in stream.finish() {
+        for chunk in stream.finish()? {
             if !speaker.speak(&mut synth, &chunk)? {
                 break;
             }
@@ -237,12 +263,13 @@ impl<'a> Speaker<'a> {
     }
 
     /// Synthesise and play one chunk. Returns false once interrupted.
-    fn speak(&mut self, synth: &mut Synthesiser, chunk: &str) -> Result<bool> {
+    fn speak(&mut self, synth: &mut Synthesiser, chunk: &Chunk) -> Result<bool> {
         if self.interrupt.load(Ordering::SeqCst) {
             self.interrupted = true;
             return Ok(false);
         }
-        let samples = synth.create(chunk, &self.args.voice, self.args.speed, &self.args.lang)?;
+        let samples =
+            synth.create_from_phonemes(&chunk.phonemes, &self.args.voice, self.args.speed)?;
         if self.interrupt.load(Ordering::SeqCst) {
             self.interrupted = true;
             return Ok(false);
@@ -274,7 +301,7 @@ impl<'a> Speaker<'a> {
             self.spoken += frames as f64 / SAMPLE_RATE as f64;
         }
         sink.write(&samples)?;
-        self.pending_gap = text::ends_sentence(chunk);
+        self.pending_gap = text::ends_sentence(&chunk.text);
         self.spoken += samples.len() as f64 / SAMPLE_RATE as f64;
 
         if self.verbose {

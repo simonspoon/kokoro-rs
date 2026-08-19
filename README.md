@@ -73,7 +73,8 @@ Options:
 | `-l, --lang LANG` | Language passed to the phonemiser (default `en-us`). |
 | `-d, --device DEV` | Output device name or index; see `--list-devices`. |
 | `--gap SECONDS` | Silence inserted between sentences (default 0.12). |
-| `--chunk-chars N` | Max characters per synthesis chunk (default 300). |
+| `--chunk-chars N` | Optional cap on the characters per synthesis chunk; off by default. |
+| `--chunk-phonemes N` | Max phonemes per synthesis chunk, the model reads 510 (default 500). |
 | `--no-download` | Fail rather than fetch missing model files. |
 | `-q, --quiet` | Suppress the progress line. |
 
@@ -82,10 +83,15 @@ Ctrl-C stops promptly, within about a second.
 ## How the streaming works
 
 Text is split into chunks on sentence boundaries and synthesised one chunk at a
-time. The first chunk is deliberately short (~100 characters) so sound starts
-quickly; later chunks are larger, which gives the model more context and better
-prosody. Playback runs on the audio callback behind a four-deep channel, so the
-next chunk is being generated while the current one is still being heard. The
+time. The first chunk is deliberately short so sound starts quickly; later ones
+are packed up to the model's phoneme budget rather than a character count,
+which gives it more context and better prosody. Characters are only a proxy for
+the real limit — "1234567" is seven of them and forty phonemes — so the text is
+phonemised once, up front, and measured directly; the phonemes are carried
+through to the synthesiser rather than derived a second time.
+
+Playback runs on the audio callback behind a four-deep channel, so the next
+chunk is being generated while the current one is still being heard. The
 channel is bounded on purpose: synthesis outruns playback by roughly 3x, so an
 unbounded one would hold an entire document's audio in memory.
 
@@ -100,9 +106,13 @@ with a script under `scripts/` that runs both and compares:
 
 | Script | Checks | Result |
 | --- | --- | --- |
-| `diff_chunking.py` | chunk boundaries, including incremental stdin | 204/204 identical |
+| `diff_chunking.py` | chunk boundaries, including incremental stdin | 204/204 identical, before the phoneme budget below |
 | `diff_phonemes.py` | IPA strings and token IDs | 148/148 identical |
 | `diff_audio.py` | rendered WAV samples | 12/13 bit-identical, 1 within 1 LSB |
+
+Chunk boundaries now deliberately diverge from the Python original, which sizes
+chunks in characters, so the 204/204 above describes the behaviour before the
+phoneme budget was introduced.
 
 The scripts expect `kokoro3` checked out beside this repo, with its virtualenv
 built, since that is what supplies the reference output. That implementation is

@@ -45,13 +45,20 @@ impl Synthesiser {
         &self.voices
     }
 
-    /// Synthesise one chunk of text, returning mono float32 samples.
-    pub fn create(&mut self, text: &str, voice: &str, speed: f32, lang: &str) -> Result<Vec<f32>> {
-        let phonemes = phonemes::phonemize(text, lang)?;
-
+    /// Synthesise one chunk, returning mono float32 samples.
+    ///
+    /// The chunker has already phonemised the text to measure it against the
+    /// model's context, so the phonemes come in ready-made rather than being
+    /// derived from the text a second time.
+    pub fn create_from_phonemes(
+        &mut self,
+        phonemes: &str,
+        voice: &str,
+        speed: f32,
+    ) -> Result<Vec<f32>> {
         let mut audio = Vec::new();
-        for batch in split_phonemes(&phonemes) {
-            let part = self.create_from_phonemes(&batch, voice, speed)?;
+        for batch in split_phonemes(phonemes) {
+            let part = self.create_batch(&batch, voice, speed)?;
             // Each batch is synthesised separately and padded with silence by
             // the model; trimming it keeps the joins from sounding halting.
             audio.extend(trim::trim(part));
@@ -59,12 +66,7 @@ impl Synthesiser {
         Ok(audio)
     }
 
-    fn create_from_phonemes(
-        &mut self,
-        phonemes: &str,
-        voice: &str,
-        speed: f32,
-    ) -> Result<Vec<f32>> {
+    fn create_batch(&mut self, phonemes: &str, voice: &str, speed: f32) -> Result<Vec<f32>> {
         let tokens = phonemes::tokenize(phonemes);
         if tokens.is_empty() {
             return Ok(Vec::new());

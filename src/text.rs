@@ -1,9 +1,23 @@
 //! Splitting incoming text into synthesis-sized chunks.
 //!
-//! Kokoro's context is 510 phonemes, but we chunk far below that: shorter
-//! chunks reach the speakers sooner, and the first chunk is kept shortest of
-//! all so that audio starts while the rest of the text is still being
+//! The real constraint is Kokoro's context of 510 phonemes, so that is what
+//! chunks are measured in: characters are only a proxy for it, and a poor one,
+//! since "1234567" is seven characters and forty phonemes. Measuring the
+//! phonemes directly lets whole sentences stay together far more often, which
+//! the model turns into better prosody. The first chunk is kept deliberately
+//! short so that audio starts while the rest of the text is still being
 //! synthesised.
+//!
+//! Each piece of text is phonemised exactly once: the phonemes a chunk was
+//! measured with are carried out with it, so the synthesiser can use them
+//! directly. Joining them at punctuation is exact —
+//! [`crate::punctuation::phonemize_preserving`] already splits there before
+//! calling espeak, so phonemising two sentences (or two clauses) separately and
+//! joining the results with a space gives the same string as phonemising the
+//! joined text. Joining across a word boundary is not, which is why the pieces
+//! [`hard_split`] cuts between words are never packed back together.
+
+use anyhow::Result;
 
 /// Titles and abbreviations whose trailing dot does not end a sentence.
 /// Splitting on these would insert an audible pause mid-phrase ("Dr. | Smith").
@@ -25,10 +39,44 @@ const CLOSERS: [char; 6] = ['"', '\'', ')', ']', '\u{201d}', '\u{2019}'];
 const CLAUSE_ENDS: [char; 4] = [',', ';', ':', '—'];
 
 pub const FIRST_CHUNK_CHARS: usize = 100;
-pub const CHUNK_CHARS: usize = 300;
+
+/// Phonemes per chunk. Kept under the model's 510 because `synth::split_phonemes`
+/// packs up to but not including that figure, and a chunk it has to split again
+/// is one this budget sized for nothing.
+pub const CHUNK_PHONEMES: usize = 500;
+pub const FIRST_CHUNK_PHONEMES: usize = 100;
 
 fn nchars(s: &str) -> usize {
     s.chars().count()
+}
+
+/// One synthesis pass: the text as it will be spoken, and the phonemes it was
+/// measured with — carried through so the synthesiser does not have to
+/// phonemise it a second time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk {
+    pub text: String,
+    pub phonemes: String,
+}
+
+/// How much a chunk may hold.
+///
+/// `phonemes` is the real limit; `chars` is an optional extra cap the user can
+/// ask for with `--chunk-chars`, applied to the text before it is phonemised.
+#[derive(Debug, Clone, Copy)]
+pub struct Budget {
+    pub phonemes: usize,
+    pub chars: Option<usize>,
+}
+
+impl Budget {
+    /// Whether `piece` still fits once appended to `buf` with a joining space.
+    fn fits(&self, buf: &Chunk, piece: &Chunk) -> bool {
+        nchars(&buf.phonemes) + 1 + nchars(&piece.phonemes) <= self.phonemes
+            && self
+                .chars
+                .is_none_or(|cap| nchars(&buf.text) + 1 + nchars(&piece.text) <= cap)
+    }
 }
 
 /// Whether the text ending at `end` is a sentence break rather than an
@@ -164,6 +212,74 @@ fn pack<'a>(parts: impl Iterator<Item = &'a str>, limit: usize, out: &mut Vec<St
     }
 }
 
+/// Builds chunks out of already-phonemised pieces, in order.
+///
+/// Text and phonemes alike are rejoined with a single space. A piece too large
+/// to fit on its own simply lands in a chunk by itself; only [`chunk_text`]
+/// knows how to break one down further.
+struct Packer {
+    /// The budget in force. Closing a chunk widens it to `rest`: only the
+    /// first chunk is held to the narrow budget that gets audio started.
+    budget: Budget,
+    rest: Budget,
+    buf: Option<Chunk>,
+    /// Whether the chunk being built may still take another piece.
+    open: bool,
+    out: Vec<Chunk>,
+}
+
+impl Packer {
+    fn new(first: Budget, rest: Budget) -> Self {
+        Self {
+            budget: first,
+            rest,
+            buf: None,
+            open: true,
+            out: Vec::new(),
+        }
+    }
+
+    /// Add `piece` to the chunk being built, closing that chunk off first if
+    /// the piece no longer fits.
+    ///
+    /// `joinable` is false for a piece that must not share a chunk with its
+    /// neighbours: [`hard_split`] can cut between two words, and words
+    /// phonemised apart are not the phonemes of the two together — espeak
+    /// reads each in the context of its neighbours, so "read" alone comes out
+    /// as the present tense whatever the sentence around it said.
+    fn push(&mut self, piece: Chunk, joinable: bool) {
+        if let Some(held) = &self.buf
+            && (!joinable || !self.open || !self.budget.fits(held, &piece))
+        {
+            self.close();
+        }
+        match &mut self.buf {
+            Some(held) => {
+                held.text.push(' ');
+                held.text.push_str(&piece.text);
+                held.phonemes.push(' ');
+                held.phonemes.push_str(&piece.phonemes);
+            }
+            None => self.buf = Some(piece),
+        }
+        self.open = joinable;
+    }
+
+    /// Finish the chunk being built, if any, and widen the budget.
+    fn close(&mut self) {
+        if let Some(held) = self.buf.take() {
+            self.out.push(held);
+            self.budget = self.rest;
+        }
+        self.open = true;
+    }
+
+    fn finish(mut self) -> Vec<Chunk> {
+        self.close();
+        self.out
+    }
+}
+
 /// Break a single over-long sentence, preferring clause then word boundaries.
 fn hard_split(text: &str, limit: usize, out: &mut Vec<String>) {
     if nchars(text) <= limit {
@@ -218,12 +334,22 @@ fn split_after<'a>(text: &'a str, marks: &[char]) -> Vec<&'a str> {
     parts.into_iter().filter(|p| !p.is_empty()).collect()
 }
 
-/// Split `text` into chunks of at most roughly `limit` characters.
-pub fn chunk_text(text: &str, limit: usize) -> Vec<String> {
+/// Split `text` into chunks, phonemising each piece once.
+///
+/// The first chunk is sized by `first` and everything after it by `rest`, so a
+/// long run of text handed over in one go still starts with a short chunk and
+/// then packs the remainder properly.
+///
+/// `phonemize` is called on every piece of text that survives the splitting, in
+/// order, and never twice on the same piece — except where a sentence turns out
+/// to be too long and has to be re-split at its clauses.
+pub fn chunk_text<F>(text: &str, first: Budget, rest: Budget, phonemize: &mut F) -> Result<Vec<Chunk>>
+where
+    F: FnMut(&str) -> Result<String>,
+{
     let text = text.trim();
-    let mut out = Vec::new();
     if text.is_empty() {
-        return out;
+        return Ok(Vec::new());
     }
 
     // Newlines end a sentence whether or not they are punctuated, so blocks
@@ -236,58 +362,104 @@ pub fn chunk_text(text: &str, limit: usize) -> Vec<String> {
         }
     }
 
-    let mut buf = String::new();
+    // Sentences are measured and packed in order, so that the budget in force
+    // is the one that applies to the chunk each piece is landing in.
+    let mut packer = Packer::new(first, rest);
     for sentence in sentences {
         let sentence = sentence.trim();
-        if nchars(sentence) > limit {
-            if !buf.is_empty() {
-                out.push(std::mem::take(&mut buf));
-            }
-            hard_split(sentence, limit, &mut out);
-            continue;
+
+        // Over the narrow first-chunk cap usually just means the sentence
+        // belongs in the next chunk, which is wider; close this one before
+        // cutting the sentence up to meet a cap it need never have met. The
+        // first chunk still honours the narrow cap, since a sentence that is
+        // going into it arrives with nothing held back.
+        if packer.buf.is_some() && packer.budget.chars.is_some_and(|cap| nchars(sentence) > cap) {
+            packer.close();
         }
-        if !buf.is_empty() && nchars(&buf) + 1 + nchars(sentence) > limit {
-            out.push(std::mem::replace(&mut buf, sentence.to_string()));
-        } else {
-            if !buf.is_empty() {
-                buf.push(' ');
+
+        // A character cap is a limit on the text itself, so it is applied
+        // before phonemising; the phoneme budget can only be checked after.
+        let mut parts = Vec::new();
+        match packer.budget.chars {
+            Some(cap) => hard_split(sentence, cap, &mut parts),
+            None => parts.push(sentence.to_string()),
+        }
+        // A sentence the cap had to cut apart was cut between words, so its
+        // pieces have to stay in the chunks they were measured for.
+        let joinable = parts.len() == 1;
+
+        for text in parts {
+            let phonemes = phonemize(&text)?;
+            if nchars(&phonemes) > packer.budget.phonemes && packer.buf.is_some() {
+                // Over the narrow first-chunk budget usually just means the
+                // piece belongs in the next chunk, which is wider; close this
+                // one and measure again before going to the trouble — and the
+                // extra phonemising — of re-splitting the sentence.
+                packer.close();
             }
-            buf.push_str(sentence);
+            if nchars(&phonemes) <= packer.budget.phonemes {
+                packer.push(Chunk { text, phonemes }, joinable);
+                continue;
+            }
+
+            // Anything that fills the budget on its own is re-split at its
+            // clauses, the least audible place to break a sentence.
+            let clauses = split_after(&text, &CLAUSE_ENDS);
+            if clauses.len() < 2 {
+                // A single clause that overruns the context is left whole for
+                // `synth::split_phonemes` to break at a word boundary in the
+                // phoneme string. Splitting the text into words and phonemising
+                // them one by one would do the same job worse: espeak reads each
+                // word in the context of its neighbours, and taken alone they
+                // come out pronounced differently.
+                packer.push(Chunk { text, phonemes }, joinable);
+                continue;
+            }
+            for (i, clause) in clauses.into_iter().enumerate() {
+                let piece = Chunk {
+                    text: clause.to_string(),
+                    phonemes: phonemize(clause)?,
+                };
+                // Clauses may rejoin each other — espeak splits at punctuation
+                // anyway, so that is exact — but the first one inherits
+                // whether the sentence itself could join what came before.
+                packer.push(piece, i > 0 || joinable);
+            }
         }
     }
-    if !buf.is_empty() {
-        out.push(buf);
-    }
-    out
+    Ok(packer.finish())
 }
 
 /// Chunks an incremental stream of text pieces (e.g. lines arriving on stdin).
 ///
 /// Text is emitted as soon as a complete chunk is available rather than waiting
 /// for the whole input, so `tail -f log | kokoro-rs` speaks as the log grows.
-pub struct ChunkStream {
-    limit: usize,
-    chunk_chars: usize,
+pub struct ChunkStream<F> {
+    /// The budget in force, narrow for the first chunk and `rest` after it.
+    budget: Budget,
+    rest: Budget,
+    phonemize: F,
     pending: String,
 }
 
-impl ChunkStream {
-    pub fn new(first_chunk_chars: usize, chunk_chars: usize) -> Self {
+impl<F: FnMut(&str) -> Result<String>> ChunkStream<F> {
+    pub fn new(first: Budget, rest: Budget, phonemize: F) -> Self {
         Self {
-            limit: first_chunk_chars,
-            chunk_chars,
+            budget: first,
+            rest,
+            phonemize,
             pending: String::new(),
         }
     }
 
     /// Feed one piece of input, returning whatever chunks are now complete.
-    pub fn push(&mut self, piece: &str) -> Vec<String> {
+    pub fn push(&mut self, piece: &str) -> Result<Vec<Chunk>> {
         self.pending.push_str(piece);
 
         // Only emit up to the last sentence boundary; the tail may still grow.
         let has_break = !sentence_breaks(&self.pending).is_empty();
-        if !has_break && nchars(&self.pending) < self.limit {
-            return Vec::new();
+        if !has_break && nchars(&self.pending) < self.flush_at() {
+            return Ok(Vec::new());
         }
 
         let emit = match rsplit_sentence(&self.pending) {
@@ -296,51 +468,127 @@ impl ChunkStream {
                 self.pending = tail;
                 head
             }
-            None if nchars(&self.pending) < self.limit => return Vec::new(),
+            None if nchars(&self.pending) < self.flush_at() => return Ok(Vec::new()),
             None => std::mem::take(&mut self.pending),
         };
         self.emit(&emit)
     }
 
     /// Flush whatever is left once the input ends.
-    pub fn finish(&mut self) -> Vec<String> {
+    pub fn finish(&mut self) -> Result<Vec<Chunk>> {
         let rest = std::mem::take(&mut self.pending);
         self.emit(&rest)
     }
 
-    fn emit(&mut self, text: &str) -> Vec<String> {
-        let chunks = chunk_text(text, self.limit);
+    /// How much unpunctuated text to hold before giving up on finding a
+    /// sentence boundary. Only a trigger for emitting — the sizing of what is
+    /// emitted is the phoneme budget, applied in [`chunk_text`] below — so
+    /// counting characters here is good enough, and avoids phonemising the
+    /// pending text on every keystroke to find out.
+    fn flush_at(&self) -> usize {
+        self.budget.chars.unwrap_or(self.budget.phonemes)
+    }
+
+    fn emit(&mut self, text: &str) -> Result<Vec<Chunk>> {
+        let chunks = chunk_text(text, self.budget, self.rest, &mut self.phonemize)?;
         // Only the very first chunk is kept short; once audio is playing,
         // larger chunks give the model more context and better prosody.
+        // `chunk_text` widens within a single call; this carries that across
+        // the calls that a streamed input arrives in.
         if !chunks.is_empty() {
-            self.limit = self.chunk_chars;
+            self.budget = self.rest;
         }
-        chunks
+        Ok(chunks)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::phonemes::MAX_PHONEME_LENGTH;
+
+    /// A stand-in phonemiser that leaves the text alone, so that phoneme counts
+    /// are character counts and the expected chunks stay readable.
+    fn identity() -> impl FnMut(&str) -> Result<String> {
+        |text: &str| Ok(text.to_string())
+    }
+
+    fn budget(phonemes: usize) -> Budget {
+        Budget {
+            phonemes,
+            chars: None,
+        }
+    }
+
+    fn texts(chunks: Vec<Chunk>) -> Vec<String> {
+        chunks.into_iter().map(|c| c.text).collect()
+    }
 
     fn chunks(text: &str, limit: usize) -> Vec<String> {
-        chunk_text(text, limit)
+        texts(chunk_text(text, budget(limit), budget(limit), &mut identity()).unwrap())
+    }
+
+    /// Chunking with `--chunk-chars` in force, capping text and phonemes alike.
+    fn capped(text: &str, limit: usize) -> Vec<String> {
+        let budget = Budget {
+            phonemes: limit,
+            chars: Some(limit),
+        };
+        texts(chunk_text(text, budget, budget, &mut identity()).unwrap())
     }
 
     #[test]
     fn splits_on_sentence_ends() {
         // Sentences are repacked greedily, so two fit inside a limit of ten.
         assert_eq!(chunks("One. Two. Three.", 10), ["One. Two.", "Three."]);
-        // "Three." exceeds a limit of five and is cut, having no inner break.
+        assert_eq!(chunks("One. Two. Three.", 5), ["One.", "Two.", "Three."]);
+        // Under a character cap of five, "Three." is over it and is cut.
         assert_eq!(
-            chunks("One. Two. Three.", 5),
+            capped("One. Two. Three.", 5),
             ["One.", "Two.", "Three", "."]
         );
     }
 
     #[test]
+    fn only_the_first_chunk_is_held_to_the_narrow_budget() {
+        // One call, several sentences: the first chunk gets audio started, and
+        // the rest is packed to the wide budget rather than the narrow one.
+        let text = "One. Two. Three. Four. Five. Six.";
+        let chunks = texts(chunk_text(text, budget(5), budget(300), &mut identity()).unwrap());
+        assert_eq!(chunks, ["One.", "Two. Three. Four. Five. Six."]);
+    }
+
+    #[test]
     fn packs_sentences_up_to_the_limit() {
         assert_eq!(chunks("One. Two. Three.", 300), ["One. Two. Three."]);
+    }
+
+    #[test]
+    fn whole_sentences_are_never_split_when_they_fit() {
+        let text = "The first sentence is fairly long. The second one is too. \
+                    A third follows it, with a clause in the middle, and an end.";
+        // Every chunk is made of whole sentences: none ends mid-sentence.
+        for chunk in chunks(text, 60) {
+            assert!(ends_sentence(&chunk), "split {chunk:?}");
+        }
+    }
+
+    #[test]
+    fn no_chunk_exceeds_the_phoneme_budget() {
+        let text = "One sentence here. Another, with a clause, follows it. \
+                    And a third, rather longer than the others, closes the lot.";
+        for limit in [20, 40, 300] {
+            for chunk in chunk_text(text, budget(limit), budget(limit), &mut identity()).unwrap() {
+                // The one documented exception is a single clause with no
+                // inner break, left whole for synth::split_phonemes.
+                let indivisible = split_after(&chunk.text, &CLAUSE_ENDS).len() == 1;
+                assert!(
+                    nchars(&chunk.phonemes) <= limit || indivisible,
+                    "{limit}: {:?}",
+                    chunk.phonemes
+                );
+            }
+        }
     }
 
     #[test]
@@ -381,16 +629,27 @@ mod tests {
     }
 
     #[test]
-    fn long_sentence_falls_back_to_words() {
+    fn over_long_clause_is_left_for_the_phoneme_splitter() {
+        // No clause boundary to break at, and no character cap asking for a
+        // word split, so the sentence is emitted whole; synth::split_phonemes
+        // breaks the phoneme string at a word boundary instead.
         assert_eq!(
             chunks("alpha beta gamma delta", 12),
+            ["alpha beta gamma delta"]
+        );
+    }
+
+    #[test]
+    fn long_sentence_falls_back_to_words_under_a_char_cap() {
+        assert_eq!(
+            capped("alpha beta gamma delta", 12),
             ["alpha beta", "gamma delta"]
         );
     }
 
     #[test]
     fn unbreakable_token_is_cut_bluntly() {
-        assert_eq!(chunks(&"x".repeat(7), 3), ["xxx", "xxx", "x"]);
+        assert_eq!(capped(&"x".repeat(7), 3), ["xxx", "xxx", "x"]);
     }
 
     #[test]
@@ -410,42 +669,135 @@ mod tests {
 
     #[test]
     fn stream_emits_the_first_chunk_early() {
-        let mut stream = ChunkStream::new(10, 300);
+        let mut stream = ChunkStream::new(budget(10), budget(300), identity());
         // No boundary and under the limit: nothing to say yet.
-        assert!(stream.push("hello ").is_empty());
-        // A sentence boundary releases the completed sentence, which at this
-        // limit is itself split; the unterminated tail is held back.
-        assert_eq!(stream.push("there. more"), ["hello", "there."]);
-        assert_eq!(stream.finish(), ["more"]);
+        assert!(stream.push("hello ").unwrap().is_empty());
+        // A sentence boundary releases the completed sentence — over the limit
+        // but with nowhere to break it — and holds back the unterminated tail.
+        assert_eq!(texts(stream.push("there. more").unwrap()), ["hello there."]);
+        assert_eq!(texts(stream.finish().unwrap()), ["more"]);
     }
 
     #[test]
     fn stream_widens_after_the_first_chunk() {
-        let mut stream = ChunkStream::new(10, 300);
+        let mut stream = ChunkStream::new(budget(10), budget(300), identity());
         assert_eq!(
-            stream.push("one. two. three. four."),
+            texts(stream.push("one. two. three. four.").unwrap()),
             ["one. two.", "three."]
         );
-        // Later chunks use the wider limit, so the tail stays in one piece.
-        assert_eq!(stream.finish(), ["four."]);
+        // Later chunks use the wider budget, so the tail stays in one piece.
+        assert_eq!(texts(stream.finish().unwrap()), ["four."]);
     }
 
     #[test]
     fn stream_handles_input_with_no_punctuation() {
-        let mut stream = ChunkStream::new(10, 20);
+        let mut stream = ChunkStream::new(budget(10), budget(20), identity());
         let mut all: Vec<String> = Vec::new();
         for word in ["alpha ", "beta ", "gamma ", "delta "] {
-            all.extend(stream.push(word));
+            all.extend(texts(stream.push(word).unwrap()));
         }
-        all.extend(stream.finish());
+        all.extend(texts(stream.finish().unwrap()));
         assert_eq!(all.concat().replace(' ', ""), "alphabetagammadelta");
     }
 
     #[test]
     fn blank_input_produces_nothing() {
         assert!(chunks("   \n  \n ", 300).is_empty());
-        let mut stream = ChunkStream::new(10, 300);
-        assert!(stream.push("  ").is_empty());
-        assert!(stream.finish().is_empty());
+        let mut stream = ChunkStream::new(budget(10), budget(300), identity());
+        assert!(stream.push("  ").unwrap().is_empty());
+        assert!(stream.finish().unwrap().is_empty());
+    }
+
+    /// The carried phonemes must be what each chunk's text phonemises to: that
+    /// is what the synthesiser speaks, and a mismatch is a mispronounced word.
+    fn assert_phonemes_match(chunks: &[Chunk]) {
+        let phonemize = |text: &str| crate::phonemes::phonemize(text, "en-us");
+        for chunk in chunks {
+            assert_eq!(
+                chunk.phonemes,
+                phonemize(&chunk.text).unwrap(),
+                "{:?}",
+                chunk.text
+            );
+        }
+    }
+
+    #[test]
+    fn word_split_pieces_are_not_rejoined() {
+        // Under a character cap the first chunk's narrow cap cuts this sentence
+        // between words; the wider cap that comes into force underneath must
+        // not put those pieces back together. espeak reads a word in the
+        // context of its neighbours, so "read" measured alone is "reed" and
+        // rejoining it would have the model say the wrong word.
+        let mut phonemize = |text: &str| crate::phonemes::phonemize(text, "en-us");
+        let text = "I have read a book and I have read a paper and then I went \
+                    away and later I came back and I have read the apple once \
+                    more today and I have read the news and I have read the \
+                    letter and then I have read the apple again.";
+        let first = Budget {
+            phonemes: FIRST_CHUNK_PHONEMES,
+            chars: Some(FIRST_CHUNK_CHARS),
+        };
+        let rest = Budget {
+            phonemes: CHUNK_PHONEMES,
+            chars: Some(300),
+        };
+        let chunks = chunk_text(text, first, rest, &mut phonemize).unwrap();
+        assert!(chunks.len() > 1);
+        assert_phonemes_match(&chunks);
+    }
+
+    #[test]
+    fn clause_splits_and_the_widening_budget_keep_the_phonemes_honest() {
+        let mut phonemize = |text: &str| crate::phonemes::phonemize(text, "en-us");
+        let text = "Hi. A second sentence, with several clauses, that is far \
+                    longer than a hundred phonemes, and keeps going, and going, \
+                    and going for a while yet. A third one follows it. And a \
+                    fourth, with a clause of its own, closes the lot.";
+        let chunks = chunk_text(
+            text,
+            budget(FIRST_CHUNK_PHONEMES),
+            budget(CHUNK_PHONEMES),
+            &mut phonemize,
+        )
+        .unwrap();
+        assert!(chunks.len() > 1);
+        assert_phonemes_match(&chunks);
+    }
+
+    #[test]
+    fn real_phonemes_fit_the_model_context() {
+        let mut phonemize = |text: &str| crate::phonemes::phonemize(text, "en-us");
+        let text = "The port keeps the same chunk boundaries as the original. \
+                    Sentences are packed greedily, so a short one rides along \
+                    with its neighbour, and a long one, full of clauses, is \
+                    broken at the commas rather than between two arbitrary \
+                    words. Numbers such as 1234567 expand several-fold into \
+                    phonemes, which is exactly why the budget is counted there \
+                    and not in characters. That is the whole idea.";
+        let chunks = chunk_text(
+            text,
+            budget(FIRST_CHUNK_PHONEMES),
+            budget(CHUNK_PHONEMES),
+            &mut phonemize,
+        )
+        .unwrap();
+
+        for chunk in &chunks {
+            assert!(
+                nchars(&chunk.phonemes) <= MAX_PHONEME_LENGTH,
+                "{} phonemes",
+                nchars(&chunk.phonemes)
+            );
+            // The carried phonemes must be what the chunk's text phonemises to,
+            // since that is what the synthesiser will speak.
+            assert_eq!(chunk.phonemes, phonemize(&chunk.text).unwrap());
+        }
+
+        let spoken: Vec<&str> = chunks
+            .iter()
+            .flat_map(|c| c.text.split_whitespace())
+            .collect();
+        assert_eq!(spoken, text.split_whitespace().collect::<Vec<_>>());
     }
 }
