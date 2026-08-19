@@ -83,12 +83,16 @@ Ctrl-C stops promptly, within about a second.
 ## How the streaming works
 
 Text is split into chunks on sentence boundaries and synthesised one chunk at a
-time. The first chunk is deliberately short so sound starts quickly; later ones
-are packed up to the model's phoneme budget rather than a character count,
-which gives it more context and better prosody. Characters are only a proxy for
-the real limit — "1234567" is seven of them and forty phonemes — so the text is
-phonemised once, up front, and measured directly; the phonemes are carried
-through to the synthesiser rather than derived a second time.
+time. The first chunk is deliberately short so sound starts quickly, and each
+one after it may be up to twice what the last actually came to, growing until
+chunks are packed to the model's phoneme budget rather than a character count,
+which gives it more context and better prosody. The ramp matters: going
+straight from a two-second opening phrase to a full-sized chunk leaves playback
+with nothing to say for several seconds while that chunk is synthesised.
+Characters are only a proxy for the real limit — "1234567" is seven of them and
+forty phonemes — so the text is phonemised once, up front, and measured
+directly; the phonemes are carried through to the synthesiser rather than
+derived a second time.
 
 Playback runs on the audio callback behind a four-deep channel, so the next
 chunk is being generated while the current one is still being heard. The

@@ -6,7 +6,8 @@
 //! phonemes directly lets whole sentences stay together far more often, which
 //! the model turns into better prosody. The first chunk is kept deliberately
 //! short so that audio starts while the rest of the text is still being
-//! synthesised.
+//! synthesised, and the budget then doubles with each chunk until it reaches
+//! the full one, so that playback of each chunk covers the making of the next.
 //!
 //! Each piece of text is phonemised exactly once: the phonemes a chunk was
 //! measured with are carried out with it, so the synthesiser can use them
@@ -70,6 +71,43 @@ pub struct Budget {
 }
 
 impl Budget {
+    /// The budget for the chunk after `held`: twice what that one actually
+    /// came to, never narrowing, and never past `full`.
+    ///
+    /// The first chunk is deliberately tiny so that audio starts quickly, which
+    /// leaves only a second or two of it playing while the next one is made.
+    /// Going straight from there to the full size asks for ten seconds of
+    /// synthesis to finish inside that — an audible gap right after the opening
+    /// phrase, and the only one, since from then on the queue stays ahead.
+    /// Synthesis runs at roughly three times real time, so each chunk can
+    /// afford to be a little under three times the last; doubling leaves room
+    /// for the per-call overhead and for a slower machine.
+    ///
+    /// It is what the chunk held that sets the pace, not what it was allowed to
+    /// hold — a budget of 100 that a sentence break cuts down to 50 buys only
+    /// half as much time to make the next one. The budget never narrows,
+    /// though: a short chunk slows the ramp rather than reversing it, since
+    /// oscillating between sizes would break sentences up for no gain.
+    ///
+    /// Early chunks being narrow does cost something: a long sentence landing
+    /// in one is split at its clauses rather than kept whole, as it would be
+    /// once the budget is full. That is the price of the ramp, and a clause
+    /// break is the least audible place to take it.
+    fn grown(self, held: &Chunk, full: Budget) -> Budget {
+        // `None` is the absence of a character cap, not a cap of zero, so the
+        // two are folded separately rather than through a common `max`.
+        let chars = |cap: usize| {
+            self.chars
+                .map_or(cap, |c| (nchars(&held.text) * 2).max(c).min(cap))
+        };
+        Budget {
+            phonemes: (nchars(&held.phonemes) * 2)
+                .max(self.phonemes)
+                .min(full.phonemes),
+            chars: full.chars.map(chars),
+        }
+    }
+
     /// Whether `piece` still fits once appended to `buf` with a joining space.
     fn fits(&self, buf: &Chunk, piece: &Chunk) -> bool {
         nchars(&buf.phonemes) + 1 + nchars(&piece.phonemes) <= self.phonemes
@@ -218,8 +256,8 @@ fn pack<'a>(parts: impl Iterator<Item = &'a str>, limit: usize, out: &mut Vec<St
 /// to fit on its own simply lands in a chunk by itself; only [`chunk_text`]
 /// knows how to break one down further.
 struct Packer {
-    /// The budget in force. Closing a chunk widens it to `rest`: only the
-    /// first chunk is held to the narrow budget that gets audio started.
+    /// The budget in force. Closing a chunk widens it a step towards `rest`,
+    /// starting from the narrow budget that gets audio playing early.
     budget: Budget,
     rest: Budget,
     buf: Option<Chunk>,
@@ -265,11 +303,11 @@ impl Packer {
         self.open = joinable;
     }
 
-    /// Finish the chunk being built, if any, and widen the budget.
+    /// Finish the chunk being built, if any, and widen the budget a step.
     fn close(&mut self) {
         if let Some(held) = self.buf.take() {
+            self.budget = self.budget.grown(&held, self.rest);
             self.out.push(held);
-            self.budget = self.rest;
         }
         self.open = true;
     }
@@ -336,14 +374,19 @@ fn split_after<'a>(text: &'a str, marks: &[char]) -> Vec<&'a str> {
 
 /// Split `text` into chunks, phonemising each piece once.
 ///
-/// The first chunk is sized by `first` and everything after it by `rest`, so a
-/// long run of text handed over in one go still starts with a short chunk and
-/// then packs the remainder properly.
+/// The first chunk is sized by `first` and each one after it by twice what its
+/// predecessor came to, up to `rest`, so a long run of text handed over in one
+/// go still starts with a short chunk and then packs the remainder properly.
 ///
 /// `phonemize` is called on every piece of text that survives the splitting, in
 /// order, and never twice on the same piece — except where a sentence turns out
 /// to be too long and has to be re-split at its clauses.
-pub fn chunk_text<F>(text: &str, first: Budget, rest: Budget, phonemize: &mut F) -> Result<Vec<Chunk>>
+pub fn chunk_text<F>(
+    text: &str,
+    first: Budget,
+    rest: Budget,
+    phonemize: &mut F,
+) -> Result<Vec<Chunk>>
 where
     F: FnMut(&str) -> Result<String>,
 {
@@ -373,7 +416,12 @@ where
         // cutting the sentence up to meet a cap it need never have met. The
         // first chunk still honours the narrow cap, since a sentence that is
         // going into it arrives with nothing held back.
-        if packer.buf.is_some() && packer.budget.chars.is_some_and(|cap| nchars(sentence) > cap) {
+        if packer.buf.is_some()
+            && packer
+                .budget
+                .chars
+                .is_some_and(|cap| nchars(sentence) > cap)
+        {
             packer.close();
         }
 
@@ -435,7 +483,8 @@ where
 /// Text is emitted as soon as a complete chunk is available rather than waiting
 /// for the whole input, so `tail -f log | kokoro-rs` speaks as the log grows.
 pub struct ChunkStream<F> {
-    /// The budget in force, narrow for the first chunk and `rest` after it.
+    /// The budget in force, narrow for the first chunk and growing towards
+    /// `rest` with each one emitted.
     budget: Budget,
     rest: Budget,
     phonemize: F,
@@ -491,12 +540,12 @@ impl<F: FnMut(&str) -> Result<String>> ChunkStream<F> {
 
     fn emit(&mut self, text: &str) -> Result<Vec<Chunk>> {
         let chunks = chunk_text(text, self.budget, self.rest, &mut self.phonemize)?;
-        // Only the very first chunk is kept short; once audio is playing,
-        // larger chunks give the model more context and better prosody.
-        // `chunk_text` widens within a single call; this carries that across
-        // the calls that a streamed input arrives in.
-        if !chunks.is_empty() {
-            self.budget = self.rest;
+        // Early chunks are kept short so playback stays ahead of synthesis;
+        // once it is, larger chunks give the model more context and better
+        // prosody. `chunk_text` widens a step per chunk within a single call;
+        // this carries that across the calls a streamed input arrives in.
+        for chunk in &chunks {
+            self.budget = self.budget.grown(chunk, self.rest);
         }
         Ok(chunks)
     }
@@ -550,12 +599,33 @@ mod tests {
     }
 
     #[test]
-    fn only_the_first_chunk_is_held_to_the_narrow_budget() {
-        // One call, several sentences: the first chunk gets audio started, and
-        // the rest is packed to the wide budget rather than the narrow one.
+    fn the_budget_doubles_with_each_chunk_up_to_the_wide_one() {
+        // One call, several sentences: the first chunk gets audio started and
+        // each one after it may be twice the size of the last, so that playback
+        // of one covers the synthesis of the next.
         let text = "One. Two. Three. Four. Five. Six.";
         let chunks = texts(chunk_text(text, budget(5), budget(300), &mut identity()).unwrap());
-        assert_eq!(chunks, ["One.", "Two. Three. Four. Five. Six."]);
+        // Budgets of 5, 8, 8, 12 and 22 characters in turn.
+        assert_eq!(chunks, ["One.", "Two.", "Three.", "Four. Five.", "Six."]);
+    }
+
+    #[test]
+    fn the_budget_grows_by_what_a_chunk_held_and_stops_at_the_wide_one() {
+        let held = |phonemes: &str| Chunk {
+            text: phonemes.to_string(),
+            phonemes: phonemes.to_string(),
+        };
+        // Twice what the chunk came to.
+        assert_eq!(budget(5).grown(&held("abcde"), budget(300)).phonemes, 10);
+        // A chunk that fell well short of its budget does not narrow it.
+        assert_eq!(budget(100).grown(&held("ab"), budget(300)).phonemes, 100);
+        // And the wide budget is the ceiling.
+        assert_eq!(
+            budget(200)
+                .grown(&held(&"x".repeat(200)), budget(300))
+                .phonemes,
+            300
+        );
     }
 
     #[test]
@@ -687,6 +757,19 @@ mod tests {
         );
         // Later chunks use the wider budget, so the tail stays in one piece.
         assert_eq!(texts(stream.finish().unwrap()), ["four."]);
+    }
+
+    #[test]
+    fn stream_carries_the_widened_budget_into_the_next_call() {
+        let mut stream = ChunkStream::new(budget(10), budget(300), identity());
+        assert_eq!(texts(stream.push("one two. ").unwrap()), ["one two."]);
+        // That chunk held eight characters, so the budget is now sixteen. The
+        // two sentences below come to twelve and share a chunk; under the
+        // narrow budget this call started with they would not have.
+        assert_eq!(
+            texts(stream.push("three. four. ").unwrap()),
+            ["three. four."]
+        );
     }
 
     #[test]
