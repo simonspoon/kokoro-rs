@@ -1,6 +1,6 @@
 [package]
 name = "kokoro-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Command-line text-to-speech with Kokoro v1.0, streaming to your speakers as it synthesises"
 license = "GPL-3.0-or-later"
